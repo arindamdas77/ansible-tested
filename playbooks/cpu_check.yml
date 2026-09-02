@@ -1,0 +1,361 @@
+---
+- name: Server CPU and Load Diagnostic
+  hosts: servers
+  become: true
+  gather_facts: true
+
+  tasks:
+
+    # ============================================================
+    # CPU STATISTICS
+    # ============================================================
+
+    - name: Get CPU statistics
+      ansible.builtin.shell: |
+        top -bn1 | grep '^%Cpu'
+      register: cpu_stats
+      changed_when: false
+
+    # ============================================================
+    # PROCESS INFORMATION
+    # ============================================================
+
+    - name: Get total process count
+      ansible.builtin.shell: |
+        ps -e --no-headers | wc -l
+      register: process_count
+      changed_when: false
+
+    - name: Get blocked processes
+      ansible.builtin.shell: |
+        ps -eo state= | grep -c '^D' || true
+      register: blocked_processes
+      changed_when: false
+
+    - name: Get zombie processes
+      ansible.builtin.shell: |
+        ps -eo state= | grep -c '^Z' || true
+      register: zombie_processes
+      changed_when: false
+
+    # ============================================================
+    # LOAD
+    # ============================================================
+
+    - name: Calculate load per CPU
+      ansible.builtin.set_fact:
+        load_per_cpu: >-
+          {{
+            (
+              ansible_loadavg['1m'] | float /
+              ansible_processor_vcpus | float
+            ) | round(2)
+          }}
+
+    # ============================================================
+    # PARSE CPU VALUES
+    # ============================================================
+
+    - name: Extract CPU values
+      ansible.builtin.set_fact:
+
+        cpu_user:
+          >-
+          {{
+            cpu_stats.stdout
+            | regex_search('[0-9.]+(?= us)')
+            | default('0')
+            | float
+          }}
+
+        cpu_system:
+          >-
+          {{
+            cpu_stats.stdout
+            | regex_search('[0-9.]+(?= sy)')
+            | default('0')
+            | float
+          }}
+
+        cpu_idle:
+          >-
+          {{
+            cpu_stats.stdout
+            | regex_search('[0-9.]+(?= id)')
+            | default('0')
+            | float
+          }}
+
+        cpu_iowait:
+          >-
+          {{
+            cpu_stats.stdout
+            | regex_search('[0-9.]+(?= wa)')
+            | default('0')
+            | float
+          }}
+
+        cpu_steal:
+          >-
+          {{
+            cpu_stats.stdout
+            | regex_search('[0-9.]+(?= st)')
+            | default('0')
+            | float
+          }}
+
+    # ============================================================
+    # LOAD STATUS + REASON
+    # ============================================================
+
+    - name: Determine load status
+      ansible.builtin.set_fact:
+
+        load_status: >-
+          {{
+            'CRITICAL'
+            if load_per_cpu | float >= 2
+            else
+            'WARNING'
+            if load_per_cpu | float >= 1
+            else
+            'OK'
+          }}
+
+        load_reason: >-
+          {{
+            'CRITICAL: Load is at '
+            ~ load_per_cpu
+            ~ ' per CPU. The system has more work waiting than the available CPU capacity.'
+            if load_per_cpu | float >= 2
+            else
+            'WARNING: Load is at '
+            ~ load_per_cpu
+            ~ ' per CPU. CPU/process pressure is elevated.'
+            if load_per_cpu | float >= 1
+            else
+            'OK: Load is at '
+            ~ load_per_cpu
+            ~ ' per CPU. No significant load pressure detected.'
+          }}
+
+    # ============================================================
+    # CPU STATUS + REASON
+    # ============================================================
+
+    - name: Determine CPU status
+      ansible.builtin.set_fact:
+
+        cpu_status: >-
+          {{
+            'CRITICAL'
+            if cpu_idle | float < 10
+            else
+            'WARNING'
+            if cpu_idle | float < 20
+            else
+            'OK'
+          }}
+
+        cpu_reason: >-
+          {{
+            'CRITICAL: CPU idle is only '
+            ~ cpu_idle
+            ~ '%. The CPU is heavily saturated.'
+            if cpu_idle | float < 10
+            else
+            'WARNING: CPU idle is '
+            ~ cpu_idle
+            ~ '%. CPU utilization is elevated.'
+            if cpu_idle | float < 20
+            else
+            'OK: CPU idle is '
+            ~ cpu_idle
+            ~ '%. No significant CPU saturation detected.'
+          }}
+
+    # ============================================================
+    # I/O WAIT STATUS + REASON
+    # ============================================================
+
+    - name: Determine I/O wait status
+      ansible.builtin.set_fact:
+
+        io_status: >-
+          {{
+            'CRITICAL'
+            if cpu_iowait | float >= 30
+            else
+            'WARNING'
+            if cpu_iowait | float >= 15
+            else
+            'OK'
+          }}
+
+        io_reason: >-
+          {{
+            'CRITICAL: CPU I/O wait is '
+            ~ cpu_iowait
+            ~ '%. Processes are spending significant time waiting for disk/storage I/O.'
+            if cpu_iowait | float >= 30
+            else
+            'WARNING: CPU I/O wait is '
+            ~ cpu_iowait
+            ~ '%. Some processes may be waiting for disk/storage I/O.'
+            if cpu_iowait | float >= 15
+            else
+            'OK: CPU I/O wait is '
+            ~ cpu_iowait
+            ~ '%. No significant I/O wait detected.'
+          }}
+
+    # ============================================================
+    # CPU STEAL STATUS + REASON
+    # ============================================================
+
+    - name: Determine CPU steal status
+      ansible.builtin.set_fact:
+
+        steal_status: >-
+          {{
+            'CRITICAL'
+            if cpu_steal | float >= 20
+            else
+            'WARNING'
+            if cpu_steal | float >= 10
+            else
+            'OK'
+          }}
+
+        steal_reason: >-
+          {{
+            'CRITICAL: CPU steal is '
+            ~ cpu_steal
+            ~ '%. The virtual machine is losing significant CPU time to the hypervisor/host.'
+            if cpu_steal | float >= 20
+            else
+            'WARNING: CPU steal is '
+            ~ cpu_steal
+            ~ '%. The VM is waiting for CPU time from the hypervisor/host.'
+            if cpu_steal | float >= 10
+            else
+            'OK: CPU steal is '
+            ~ cpu_steal
+            ~ '%. No significant hypervisor CPU contention detected.'
+          }}
+
+    # ============================================================
+    # BLOCKED PROCESS STATUS
+    # ============================================================
+
+    - name: Determine blocked process status
+      ansible.builtin.set_fact:
+
+        blocked_status: >-
+          {{
+            'CRITICAL'
+            if blocked_processes.stdout | int >= 10
+            else
+            'WARNING'
+            if blocked_processes.stdout | int >= 3
+            else
+            'OK'
+          }}
+
+        blocked_reason: >-
+          {{
+            'CRITICAL: '
+            ~ blocked_processes.stdout
+            ~ ' processes are blocked in uninterruptible state. Possible storage/I/O problem.'
+            if blocked_processes.stdout | int >= 10
+            else
+            'WARNING: '
+            ~ blocked_processes.stdout
+            ~ ' processes are blocked. Investigate disk or I/O activity.'
+            if blocked_processes.stdout | int >= 3
+            else
+            'OK: No significant blocked processes detected.'
+          }}
+
+    # ============================================================
+    # ZOMBIE PROCESS STATUS
+    # ============================================================
+
+    - name: Determine zombie process status
+      ansible.builtin.set_fact:
+
+        zombie_status: >-
+          {{
+            'CRITICAL'
+            if zombie_processes.stdout | int >= 10
+            else
+            'WARNING'
+            if zombie_processes.stdout | int >= 3
+            else
+            'OK'
+          }}
+
+        zombie_reason: >-
+          {{
+            'CRITICAL: '
+            ~ zombie_processes.stdout
+            ~ ' zombie processes detected. Parent processes may not be cleaning up child processes.'
+            if zombie_processes.stdout | int >= 10
+            else
+            'WARNING: '
+            ~ zombie_processes.stdout
+            ~ ' zombie processes detected. Investigate the parent process.'
+            if zombie_processes.stdout | int >= 3
+            else
+            'OK: No significant zombie processes detected.'
+          }}
+
+    # ============================================================
+    # FINAL REPORT
+    # ============================================================
+
+    - name: Display CPU diagnostic report
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "CPU / LOAD HEALTH REPORT"
+          - "============================================================"
+          - "SERVER          : {{ inventory_hostname }}"
+          - "HOSTNAME        : {{ ansible_hostname }}"
+          - "CPU CORES       : {{ ansible_processor_vcpus }}"
+          - ""
+          - "---------------- LOAD ----------------"
+          - "LOAD 1 MIN      : {{ ansible_loadavg['1m'] }}"
+          - "LOAD 5 MIN      : {{ ansible_loadavg['5m'] }}"
+          - "LOAD 15 MIN     : {{ ansible_loadavg['15m'] }}"
+          - "LOAD / CPU      : {{ load_per_cpu }}"
+          - "LOAD STATUS     : {{ load_status }}"
+          - "LOAD REASON     : {{ load_reason }}"
+          - ""
+          - "---------------- CPU -----------------"
+          - "USER            : {{ cpu_user }}%"
+          - "SYSTEM          : {{ cpu_system }}%"
+          - "IDLE            : {{ cpu_idle }}%"
+          - "IOWAIT          : {{ cpu_iowait }}%"
+          - "STEAL           : {{ cpu_steal }}%"
+          - "CPU STATUS      : {{ cpu_status }}"
+          - "CPU REASON      : {{ cpu_reason }}"
+          - ""
+          - "---------------- I/O -----------------"
+          - "I/O STATUS      : {{ io_status }}"
+          - "I/O REASON      : {{ io_reason }}"
+          - ""
+          - "---------------- VM CPU -------------"
+          - "STEAL STATUS    : {{ steal_status }}"
+          - "STEAL REASON    : {{ steal_reason }}"
+          - ""
+          - "---------------- PROCESSES -----------"
+          - "TOTAL PROCESSES  : {{ process_count.stdout }}"
+          - "BLOCKED         : {{ blocked_processes.stdout }}"
+          - "BLOCKED STATUS  : {{ blocked_status }}"
+          - "BLOCKED REASON  : {{ blocked_reason }}"
+          - "ZOMBIES         : {{ zombie_processes.stdout }}"
+          - "ZOMBIE STATUS   : {{ zombie_status }}"
+          - "ZOMBIE REASON   : {{ zombie_reason }}"
+          - ""
+          - "============================================================"

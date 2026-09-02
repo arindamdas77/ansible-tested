@@ -1,0 +1,503 @@
+---
+- name: Step 4 - Memory and Swap Health Check
+  hosts: servers
+  become: true
+  gather_facts: true
+
+  tasks:
+
+    # ============================================================
+    # 1. GET MEMORY INFORMATION
+    # ============================================================
+
+    - name: Get memory information
+      ansible.builtin.shell: |
+        free -b
+      register: memory_raw
+      changed_when: false
+
+    # ============================================================
+    # 2. GET EXACT MEMORY VALUES
+    # ============================================================
+
+    - name: Get exact memory values
+      ansible.builtin.shell: |
+        free -b | awk '
+        /^Mem:/ {
+          printf "TOTAL=%s\n", $2
+          printf "USED=%s\n", $3
+          printf "FREE=%s\n", $4
+          printf "SHARED=%s\n", $5
+          printf "BUFFERS=%s\n", $6
+          printf "CACHE=%s\n", $7
+          printf "AVAILABLE=%s\n", $7
+        }'
+      register: memory_values
+      changed_when: false
+
+    # ============================================================
+    # 3. PARSE MEMORY VALUES
+    # ============================================================
+
+    - name: Set memory values
+      ansible.builtin.set_fact:
+
+        memory_total_bytes: >-
+          {{ memory_values.stdout
+             | regex_findall('TOTAL=(\d+)')
+             | first
+             | default('0')
+             | int }}
+
+        memory_used_bytes: >-
+          {{ memory_values.stdout
+             | regex_findall('USED=(\d+)')
+             | first
+             | default('0')
+             | int }}
+
+        memory_free_bytes: >-
+          {{ memory_values.stdout
+             | regex_findall('FREE=(\d+)')
+             | first
+             | default('0')
+             | int }}
+
+        memory_shared_bytes: >-
+          {{ memory_values.stdout
+             | regex_findall('SHARED=(\d+)')
+             | first
+             | default('0')
+             | int }}
+
+        memory_buffers_bytes: >-
+          {{ memory_values.stdout
+             | regex_findall('BUFFERS=(\d+)')
+             | first
+             | default('0')
+             | int }}
+
+        memory_cache_bytes: >-
+          {{ memory_values.stdout
+             | regex_findall('CACHE=(\d+)')
+             | first
+             | default('0')
+             | int }}
+
+    # ============================================================
+    # 4. AVAILABLE MEMORY
+    # ============================================================
+
+    - name: Get available memory
+      ansible.builtin.shell: |
+        free -b | awk '/^Mem:/ {print $7}'
+      register: available_memory
+      changed_when: false
+
+    - name: Set available memory
+      ansible.builtin.set_fact:
+        memory_available_bytes: "{{ available_memory.stdout | int }}"
+
+    # ============================================================
+    # 5. CALCULATE MEMORY PERCENTAGES
+    # ============================================================
+
+    - name: Calculate memory percentages
+      ansible.builtin.shell: |
+        awk -v total="{{ memory_total_bytes | int }}" \
+            -v used="{{ memory_used_bytes | int }}" \
+            -v available="{{ memory_available_bytes | int }}" \
+            -v free="{{ memory_free_bytes | int }}" '
+        BEGIN {
+          if (total > 0) {
+            printf "USED_PERCENT=%.2f\n", (used / total) * 100
+            printf "AVAILABLE_PERCENT=%.2f\n", (available / total) * 100
+            printf "FREE_PERCENT=%.2f\n", (free / total) * 100
+          }
+          else {
+            print "USED_PERCENT=0"
+            print "AVAILABLE_PERCENT=0"
+            print "FREE_PERCENT=0"
+          }
+        }'
+      register: memory_percentages
+      changed_when: false
+
+    - name: Set memory percentages
+      ansible.builtin.set_fact:
+
+        memory_used_percent: >-
+          {{ memory_percentages.stdout
+             | regex_findall('USED_PERCENT=([0-9.]+)')
+             | first
+             | default('0')
+             | float }}
+
+        memory_available_percent: >-
+          {{ memory_percentages.stdout
+             | regex_findall('AVAILABLE_PERCENT=([0-9.]+)')
+             | first
+             | default('0')
+             | float }}
+
+        memory_free_percent: >-
+          {{ memory_percentages.stdout
+             | regex_findall('FREE_PERCENT=([0-9.]+)')
+             | first
+             | default('0')
+             | float }}
+
+    # ============================================================
+    # 6. SWAP INFORMATION
+    # ============================================================
+
+    - name: Get swap information
+      ansible.builtin.shell: |
+        free -b | awk '
+        /^Swap:/ {
+          printf "TOTAL=%s\n", $2
+          printf "USED=%s\n", $3
+          printf "FREE=%s\n", $4
+
+          if ($2 > 0) {
+            printf "USAGE_PERCENT=%.2f\n", ($3/$2)*100
+          }
+          else {
+            print "USAGE_PERCENT=0"
+          }
+        }'
+      register: swap_values
+      changed_when: false
+
+    # ============================================================
+    # 7. PARSE SWAP
+    # ============================================================
+
+    - name: Set swap values
+      ansible.builtin.set_fact:
+
+        swap_total_bytes: >-
+          {{ swap_values.stdout
+             | regex_findall('TOTAL=(\d+)')
+             | first
+             | default('0')
+             | int }}
+
+        swap_used_bytes: >-
+          {{ swap_values.stdout
+             | regex_findall('USED=(\d+)')
+             | first
+             | default('0')
+             | int }}
+
+        swap_free_bytes: >-
+          {{ swap_values.stdout
+             | regex_findall('FREE=(\d+)')
+             | first
+             | default('0')
+             | int }}
+
+        swap_used_percent: >-
+          {{ swap_values.stdout
+             | regex_findall('USAGE_PERCENT=([0-9.]+)')
+             | first
+             | default('0')
+             | float }}
+
+    # ============================================================
+    # 8. SWAP ACTIVITY
+    # ============================================================
+
+    - name: Get swap activity
+      ansible.builtin.shell: |
+        vmstat 1 2 | tail -1
+      register: vmstat_output
+      changed_when: false
+
+    - name: Set swap activity
+      ansible.builtin.set_fact:
+
+        swap_in_kbps: >-
+          {{ vmstat_output.stdout.split()[6]
+             | default('0')
+             | int }}
+
+        swap_out_kbps: >-
+          {{ vmstat_output.stdout.split()[7]
+             | default('0')
+             | int }}
+
+    # ============================================================
+    # 9. MEMORY PRESSURE
+    # ============================================================
+
+    - name: Get memory pressure information
+      ansible.builtin.shell: |
+        if [ -f /proc/pressure/memory ]; then
+          cat /proc/pressure/memory
+        else
+          echo "PSI_NOT_AVAILABLE"
+        fi
+      register: memory_psi
+      changed_when: false
+
+    # ============================================================
+    # 10. OOM KILLER
+    # ============================================================
+
+    - name: Check OOM killer events
+      ansible.builtin.shell: |
+        journalctl -k --no-pager -q 2>/dev/null |
+        grep -Ei \
+        'out of memory|oom-killer|killed process|memory cgroup out of memory' |
+        tail -20 || true
+      register: oom_events
+      changed_when: false
+
+    # ============================================================
+    # 11. MEMORY STATUS
+    # ============================================================
+
+    - name: Determine memory status
+      ansible.builtin.set_fact:
+
+        memory_status: >-
+          {{
+            'CRITICAL'
+            if memory_available_percent | float < 5
+            else
+            'WARNING'
+            if memory_available_percent | float < 15
+            else
+            'OK'
+          }}
+
+    - name: Determine memory reason
+      ansible.builtin.set_fact:
+
+        memory_reason: >-
+          {{
+            'CRITICAL: Only '
+            ~ (memory_available_percent | float | round(2))
+            ~ '% RAM is available. Severe memory pressure detected.'
+            if memory_available_percent | float < 5
+            else
+            'WARNING: Only '
+            ~ (memory_available_percent | float | round(2))
+            ~ '% RAM is available. Memory usage is high and should be investigated.'
+            if memory_available_percent | float < 15
+            else
+            'OK: '
+            ~ (memory_available_percent | float | round(2))
+            ~ '% RAM is available. No significant memory pressure detected.'
+          }}
+
+    # ============================================================
+    # 12. SWAP STATUS
+    # ============================================================
+
+    - name: Determine swap status
+      ansible.builtin.set_fact:
+
+        swap_status: >-
+          {{
+            'CRITICAL'
+            if swap_used_percent | float >= 80
+            else
+            'WARNING'
+            if swap_used_percent | float >= 30
+            else
+            'OK'
+          }}
+
+    - name: Determine swap reason
+      ansible.builtin.set_fact:
+
+        swap_reason: >-
+          {{
+            'CRITICAL: Swap usage is '
+            ~ (swap_used_percent | float | round(2))
+            ~ '%. Severe swap consumption detected.'
+            if swap_used_percent | float >= 80
+            else
+            'WARNING: Swap usage is '
+            ~ (swap_used_percent | float | round(2))
+            ~ '%. Investigate memory pressure and active swapping.'
+            if swap_used_percent | float >= 30
+            else
+            'OK: Swap usage is '
+            ~ (swap_used_percent | float | round(2))
+            ~ '%. No significant swap consumption detected.'
+          }}
+
+    # ============================================================
+    # 13. SWAP ACTIVITY STATUS
+    # ============================================================
+
+    - name: Determine swap activity status
+      ansible.builtin.set_fact:
+
+        swap_activity_status: >-
+          {{
+            'WARNING'
+            if swap_in_kbps | int > 0 or swap_out_kbps | int > 0
+            else
+            'OK'
+          }}
+
+    - name: Determine swap activity reason
+      ansible.builtin.set_fact:
+
+        swap_activity_reason: >-
+          {{
+            'WARNING: The server is actively moving memory between RAM and swap. Investigate memory pressure.'
+            if swap_in_kbps | int > 0 or swap_out_kbps | int > 0
+            else
+            'OK: No active swap-in or swap-out detected during the sample.'
+          }}
+
+    # ============================================================
+    # 14. OOM STATUS
+    # ============================================================
+
+    - name: Determine OOM status
+      ansible.builtin.set_fact:
+
+        oom_status: >-
+          {{
+            'CRITICAL'
+            if oom_events.stdout | trim | length > 0
+            else
+            'OK'
+          }}
+
+    - name: Determine OOM reason
+      ansible.builtin.set_fact:
+
+        oom_reason: >-
+          {{
+            'CRITICAL: OOM killer events were detected. The kernel has killed or attempted to kill processes because of memory exhaustion.'
+            if oom_events.stdout | trim | length > 0
+            else
+            'OK: No OOM killer events detected in the kernel journal.'
+          }}
+
+    # ============================================================
+    # 15. MEMORY PSI STATUS
+    # ============================================================
+
+    - name: Determine PSI status
+      ansible.builtin.set_fact:
+
+        memory_psi_status: >-
+          {{
+            'AVAILABLE'
+            if memory_psi.stdout != 'PSI_NOT_AVAILABLE'
+            else
+            'NOT AVAILABLE'
+          }}
+
+    # ============================================================
+    # 16. OVERALL MEMORY HEALTH
+    # ============================================================
+
+    - name: Determine overall memory health
+      ansible.builtin.set_fact:
+
+        overall_memory_status: >-
+          {{
+            'CRITICAL'
+            if memory_status == 'CRITICAL'
+               or swap_status == 'CRITICAL'
+               or oom_status == 'CRITICAL'
+            else
+            'WARNING'
+            if memory_status == 'WARNING'
+               or swap_status == 'WARNING'
+               or swap_activity_status == 'WARNING'
+            else
+            'OK'
+          }}
+
+    - name: Determine overall memory reason
+      ansible.builtin.set_fact:
+
+        overall_memory_reason: >-
+          {{
+            'CRITICAL: Memory exhaustion, severe swap usage, or OOM activity detected.'
+            if overall_memory_status == 'CRITICAL'
+            else
+            'WARNING: Memory pressure or active swap activity detected. Investigation recommended.'
+            if overall_memory_status == 'WARNING'
+            else
+            'OK: RAM and swap conditions are healthy.'
+          }}
+
+    # ============================================================
+    # 17. FINAL REPORT
+    # ============================================================
+
+    - name: Display memory health report
+      ansible.builtin.debug:
+        msg:
+
+          - "============================================================"
+          - "MEMORY / RAM HEALTH REPORT"
+          - "============================================================"
+
+          - "SERVER          : {{ inventory_hostname }}"
+          - "HOSTNAME        : {{ ansible_hostname }}"
+          - "OS              : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - ""
+
+          - "---------------- RAM ----------------"
+
+          - "TOTAL RAM       : {{ (((memory_total_bytes | int) / 1024 / 1024 / 1024) | round(2)) }} GB"
+          - "USED RAM        : {{ (((memory_used_bytes | int) / 1024 / 1024 / 1024) | round(2)) }} GB"
+          - "AVAILABLE RAM   : {{ (((memory_available_bytes | int) / 1024 / 1024 / 1024) | round(2)) }} GB"
+          - "FREE RAM        : {{ (((memory_free_bytes | int) / 1024 / 1024 / 1024) | round(2)) }} GB"
+          - "SHARED          : {{ (((memory_shared_bytes | int) / 1024 / 1024 / 1024) | round(2)) }} GB"
+          - "BUFFERS         : {{ (((memory_buffers_bytes | int) / 1024 / 1024 / 1024) | round(2)) }} GB"
+          - "CACHE           : {{ (((memory_cache_bytes | int) / 1024 / 1024 / 1024) | round(2)) }} GB"
+          - "USED            : {{ memory_used_percent | float | round(2) }}%"
+          - "AVAILABLE       : {{ memory_available_percent | float | round(2) }}%"
+          - "FREE            : {{ memory_free_percent | float | round(2) }}%"
+          - "MEMORY STATUS   : {{ memory_status }}"
+          - "MEMORY REASON   : {{ memory_reason }}"
+          - ""
+
+          - "---------------- SWAP ---------------"
+
+          - "SWAP TOTAL      : {{ (((swap_total_bytes | int) / 1024 / 1024 / 1024) | round(2)) }} GB"
+          - "SWAP USED       : {{ (((swap_used_bytes | int) / 1024 / 1024 / 1024) | round(2)) }} GB"
+          - "SWAP FREE       : {{ (((swap_free_bytes | int) / 1024 / 1024 / 1024) | round(2)) }} GB"
+          - "SWAP USAGE      : {{ swap_used_percent | float | round(2) }}%"
+          - "SWAP STATUS     : {{ swap_status }}"
+          - "SWAP REASON     : {{ swap_reason }}"
+          - ""
+
+          - "---------------- SWAP ACTIVITY ------"
+
+          - "SWAP IN         : {{ swap_in_kbps | int }} KB/s"
+          - "SWAP OUT        : {{ swap_out_kbps | int }} KB/s"
+          - "ACTIVITY STATUS : {{ swap_activity_status }}"
+          - "ACTIVITY REASON : {{ swap_activity_reason }}"
+          - ""
+
+          - "---------------- MEMORY PSI ---------"
+
+          - "PSI STATUS      : {{ memory_psi_status }}"
+          - "PSI DATA        :"
+          - "{{ memory_psi.stdout }}"
+          - ""
+
+          - "---------------- OOM -----------------"
+
+          - "OOM STATUS      : {{ oom_status }}"
+          - "OOM REASON      : {{ oom_reason }}"
+          - ""
+
+          - "============================================================"
+          - "OVERALL MEMORY STATUS : {{ overall_memory_status }}"
+          - "OVERALL REASON        : {{ overall_memory_reason }}"
+          - "============================================================"

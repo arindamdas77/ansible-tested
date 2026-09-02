@@ -1,0 +1,24 @@
+---
+- name: Server Information Check
+  hosts: servers
+  become: true
+  gather_facts: true
+
+  tasks:
+
+    - name: Display server information
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "SERVER: {{ inventory_hostname }}"
+          - "HOSTNAME: {{ ansible_hostname }}"
+          - "IP: {{ ansible_default_ipv4.address | default('N/A') }}"
+          - "OS: {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "KERNEL: {{ ansible_kernel }}"
+          - "CPU CORES: {{ ansible_processor_vcpus }}"
+          - "RAM: {{ (ansible_memtotal_mb / 1024) | round(2) }} GB"
+          - "UPTIME: {{ (ansible_uptime_seconds / 3600) | round(2) }} hours"
+          - "LOAD 1m: {{ ansible_loadavg['1m'] }}"
+          - "LOAD 5m: {{ ansible_loadavg['5m'] }}"
+          - "LOAD 15m: {{ ansible_loadavg['15m'] }}"
+          - "=========================================="
