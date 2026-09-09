@@ -1,0 +1,173 @@
+---
+- name: Step 5 - Storage and Disk Health Check
+  hosts: servers
+  become: true
+  gather_facts: true
+
+  tasks:
+
+    - name: Get filesystem usage
+      ansible.builtin.command: df -hP -x tmpfs -x devtmpfs -x squashfs
+      register: filesystem_human
+      changed_when: false
+
+    - name: Get inode usage
+      ansible.builtin.command: df -Pi -x tmpfs -x devtmpfs -x squashfs
+      register: inode_usage
+      changed_when: false
+
+    - name: Find warning filesystem usage
+      ansible.builtin.shell: |
+        df -P -x tmpfs -x devtmpfs -x squashfs | awk 'NR>1 {gsub("%","",$5); if ($5 >= 80 && $5 < 90) print $1 " on " $6 " is " $5 "% full"}'
+      register: disk_warning
+      changed_when: false
+
+    - name: Find critical filesystem usage
+      ansible.builtin.shell: |
+        df -P -x tmpfs -x devtmpfs -x squashfs | awk 'NR>1 {gsub("%","",$5); if ($5 >= 90) print $1 " on " $6 " is " $5 "% full"}'
+      register: disk_critical
+      changed_when: false
+
+    - name: Find warning inode usage
+      ansible.builtin.shell: |
+        df -Pi -x tmpfs -x devtmpfs -x squashfs | awk 'NR>1 {gsub("%","",$5); if ($5 >= 80 && $5 < 90) print $1 " on " $6 " has " $5 "% inode usage"}'
+      register: inode_warning
+      changed_when: false
+
+    - name: Find critical inode usage
+      ansible.builtin.shell: |
+        df -Pi -x tmpfs -x devtmpfs -x squashfs | awk 'NR>1 {gsub("%","",$5); if ($5 >= 90) print $1 " on " $6 " has " $5 "% inode usage"}'
+      register: inode_critical
+      changed_when: false
+
+    - name: Check read-only filesystems
+      ansible.builtin.shell: |
+        findmnt -rn -o TARGET,OPTIONS | awk '$2 ~ /(^|,)ro(,|$)/ {print $1}'
+      register: readonly_filesystems
+      changed_when: false
+
+    - name: Check iostat availability
+      ansible.builtin.shell: |
+        if command -v iostat >/dev/null 2>&1; then
+          echo AVAILABLE
+        else
+          echo NOT_AVAILABLE
+        fi
+      register: iostat_available
+      changed_when: false
+
+    - name: Get disk I/O sample
+      ansible.builtin.shell: |
+        iostat -dx 1 2 | awk '
+          /^Device/ {seen++; next}
+          seen >= 2 && NF >= 14 && $1 !~ /^(loop|ram)/ {
+            util=$NF
+            await=$(NF-1)
+            if (util >= 90 || await >= 100)
+              printf "%s util=%.2f%% await=%.2fms\n", $1, util, await
+          }'
+      register: disk_io_problem
+      changed_when: false
+      when: iostat_available.stdout == 'AVAILABLE'
+
+    - name: Set I/O result
+      ansible.builtin.set_fact:
+        disk_io_problem_text: "{{ disk_io_problem.stdout | default('') }}"
+
+    - name: Determine statuses
+      ansible.builtin.set_fact:
+        capacity_status: "{{ 'CRITICAL' if disk_critical.stdout | trim | length > 0 else 'WARNING' if disk_warning.stdout | trim | length > 0 else 'OK' }}"
+
+        inode_status: "{{ 'CRITICAL' if inode_critical.stdout | trim | length > 0 else 'WARNING' if inode_warning.stdout | trim | length > 0 else 'OK' }}"
+
+        mount_status: "{{ 'CRITICAL' if readonly_filesystems.stdout | trim | length > 0 else 'OK' }}"
+
+        io_status: "{{ 'WARNING' if disk_io_problem_text | trim | length > 0 else 'NOT CHECKED' if iostat_available.stdout != 'AVAILABLE' else 'OK' }}"
+
+    - name: Determine overall storage status
+      ansible.builtin.set_fact:
+        storage_status: "{{ 'CRITICAL' if capacity_status == 'CRITICAL' or inode_status == 'CRITICAL' or mount_status == 'CRITICAL' else 'WARNING' if capacity_status == 'WARNING' or inode_status == 'WARNING' or io_status == 'WARNING' else 'OK' }}"
+
+    - name: Determine overall reason
+      ansible.builtin.set_fact:
+        storage_reason: "{{ 'CRITICAL: Disk capacity, inode capacity, or read-only filesystem issue requires immediate attention.' if storage_status == 'CRITICAL' else 'WARNING: Storage usage, inode usage, or disk I/O requires investigation.' if storage_status == 'WARNING' else 'OK: Disk capacity, inode usage, and mount status are healthy.' }}"
+
+    - name: Display simple storage health report
+      ansible.builtin.debug:
+        msg:
+
+          - "============================================================"
+          - "STORAGE / DISK HEALTH REPORT"
+          - "============================================================"
+
+          - "SERVER           : {{ inventory_hostname }}"
+          - "HOSTNAME         : {{ ansible_hostname }}"
+          - "OS               : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+
+          - ""
+
+          - "DISK SPACE STATUS: {{ capacity_status }}"
+
+          - >-
+            DISK REASON      :
+            {{
+              disk_critical.stdout
+              if disk_critical.stdout | trim | length > 0
+              else
+              disk_warning.stdout
+              if disk_warning.stdout | trim | length > 0
+              else
+              'OK: All checked filesystems are below 80% usage.'
+            }}
+
+          - ""
+
+          - "INODE STATUS     : {{ inode_status }}"
+
+          - >-
+            INODE REASON     :
+            {{
+              inode_critical.stdout
+              if inode_critical.stdout | trim | length > 0
+              else
+              inode_warning.stdout
+              if inode_warning.stdout | trim | length > 0
+              else
+              'OK: All checked filesystems are below 80% inode usage.'
+            }}
+
+          - ""
+
+          - "MOUNT STATUS     : {{ mount_status }}"
+
+          - >-
+            MOUNT REASON     :
+            {{
+              'CRITICAL: Read-only filesystem detected: ' ~ readonly_filesystems.stdout
+              if readonly_filesystems.stdout | trim | length > 0
+              else
+              'OK: No read-only filesystem detected.'
+            }}
+
+          - ""
+
+          - "DISK I/O STATUS  : {{ io_status }}"
+
+          - >-
+            DISK I/O REASON  :
+            {{
+              'WARNING: High disk utilization or latency detected: ' ~ disk_io_problem_text
+              if disk_io_problem_text | trim | length > 0
+              else
+              'NOT CHECKED: iostat is not installed; no software was installed.'
+              if iostat_available.stdout != 'AVAILABLE'
+              else
+              'OK: No high disk utilization or latency detected during the sample.'
+            }}
+
+          - ""
+
+          - "============================================================"
+          - "OVERALL STORAGE STATUS : {{ storage_status }}"
+          - "OVERALL REASON         : {{ storage_reason }}"
+          - "============================================================"
