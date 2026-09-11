@@ -1,0 +1,608 @@
+---
+- name: Advanced Network Health and Port Security Check
+  hosts: servers
+  become: true
+  gather_facts: true
+
+  vars:
+    default_ssh_port: "22"
+
+  tasks:
+
+    ####################################################################
+    # BASIC SERVER INFORMATION
+    ####################################################################
+
+    - name: Get public IPv4 address
+      shell: |
+        ip -4 addr show scope global \
+        | awk '/inet / {print $2}' \
+        | head -1
+      register: primary_ip
+      changed_when: false
+      failed_when: false
+
+    - name: Get hostname
+      command: hostname
+      register: hostname_output
+      changed_when: false
+
+    ####################################################################
+    # NETWORK INFORMATION
+    ####################################################################
+
+    - name: Get default gateway
+      shell: |
+        ip route show default | head -1
+      register: gateway_output
+      changed_when: false
+      failed_when: false
+
+    - name: Get DNS servers
+      shell: |
+        grep '^nameserver' /etc/resolv.conf 2>/dev/null \
+        | awk '{print $2}' \
+        | sort -u
+      register: dns_output
+      changed_when: false
+      failed_when: false
+
+    - name: Get primary active interfaces
+      shell: |
+        ip -o link show up \
+        | awk -F': ' '{print $2}' \
+        | grep -Ev '^(lo|docker0|br-|veth)' || true
+      register: interfaces_output
+      changed_when: false
+      failed_when: false
+
+    ####################################################################
+    # INTERNET CONNECTIVITY
+    ####################################################################
+
+    - name: Check internet connectivity
+      shell: |
+        ping -c 2 -W 2 8.8.8.8 >/dev/null 2>&1
+      register: internet_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set internet status
+      set_fact:
+        internet_status: "{{ 'OK' if internet_check.rc == 0 else 'FAILED' }}"
+
+    ####################################################################
+    # DNS CONNECTIVITY
+    ####################################################################
+
+    - name: Check DNS resolution
+      shell: |
+        getent hosts google.com >/dev/null 2>&1
+      register: dns_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set DNS status
+      set_fact:
+        dns_status: "{{ 'OK' if dns_check.rc == 0 else 'FAILED' }}"
+
+    ####################################################################
+    # SSH CONFIGURATION
+    ####################################################################
+
+    - name: Get configured SSH port
+      shell: |
+        grep -Ei '^[[:space:]]*Port[[:space:]]+[0-9]+' \
+        /etc/ssh/sshd_config 2>/dev/null \
+        | awk '{print $2}' \
+        | tail -1
+      register: ssh_port_output
+      changed_when: false
+      failed_when: false
+
+    - name: Set SSH port
+      set_fact:
+        ssh_port: >-
+          {{
+            ssh_port_output.stdout | trim
+            if ssh_port_output.stdout | trim | length > 0
+            else default_ssh_port
+          }}
+
+    - name: Check SSH port listening
+      shell: |
+        ss -H -lnt | grep -E "[:.]{{ ssh_port }}([[:space:]]|$)" >/dev/null
+      register: ssh_port_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set SSH status
+      set_fact:
+        ssh_status: "{{ 'OK' if ssh_port_check.rc == 0 else 'FAILED' }}"
+
+    ####################################################################
+    # WEB PORT CHECK
+    ####################################################################
+
+    - name: Check HTTP port
+      shell: |
+        ss -H -lnt | awk '{print $4}' | grep -Eq '(:|\.)80$'
+      register: http_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check HTTPS port
+      shell: |
+        ss -H -lnt | awk '{print $4}' | grep -Eq '(:|\.)443$'
+      register: https_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set web status
+      set_fact:
+        http_status: "{{ 'LISTENING' if http_check.rc == 0 else 'NOT LISTENING' }}"
+        https_status: "{{ 'LISTENING' if https_check.rc == 0 else 'NOT LISTENING' }}"
+
+    ####################################################################
+    # ALL LISTENING PORTS
+    ####################################################################
+
+    - name: Get readable listening ports
+      shell: |
+        ss -H -lntup 2>/dev/null | awk '
+        {
+          proto=$1
+          local=$5
+
+          port=local
+          sub(/^.*:/,"",port)
+
+          if (port == "*" || port == "")
+            next
+
+          process="unknown"
+
+          if (match($0,/users:\(\("[^"]+"/)) {
+            process=substr($0,RSTART,RLENGTH)
+            sub(/^users:\(\("/,"",process)
+            sub(/".*$/,"",process)
+          }
+
+          if (local ~ /^127\./ || local ~ /^\[::1\]/) {
+            access="LOCAL ONLY"
+          }
+          else if (local ~ /^\*/ || local ~ /^0\.0\.0\.0/ || local ~ /^\[::\]/) {
+            access="PUBLIC"
+          }
+          else {
+            access="PRIVATE"
+          }
+
+          key=proto "|" port "|" process "|" access
+
+          if (!seen[key]++) {
+            printf "%-8s %-10s %-28s %s\n", port, proto, process, access
+          }
+        }' | sort -n -k1,1
+      register: ports_output
+      changed_when: false
+      failed_when: false
+
+    ####################################################################
+    # PORT COUNT
+    ####################################################################
+
+    - name: Count unique listening ports
+      shell: |
+        ss -H -lntu 2>/dev/null \
+        | awk '
+          {
+            address=$5
+            port=address
+            sub(/^.*:/,"",port)
+
+            if (port != "*" && port != "")
+              print $1 ":" port
+          }
+        ' \
+        | sort -u \
+        | wc -l
+      register: port_count
+      changed_when: false
+      failed_when: false
+
+    ####################################################################
+    # PUBLIC PORTS ONLY
+    ####################################################################
+
+    - name: Get publicly exposed ports
+      shell: |
+        ss -H -lntup 2>/dev/null | awk '
+        {
+          proto=$1
+          local=$5
+
+          port=local
+          sub(/^.*:/,"",port)
+
+          if (local ~ /^\*/ ||
+              local ~ /^0\.0\.0\.0/ ||
+              local ~ /^\[::\]/) {
+
+            process="unknown"
+
+            if (match($0,/users:\(\("[^"]+"/)) {
+              process=substr($0,RSTART,RLENGTH)
+              sub(/^users:\(\("/,"",process)
+              sub(/".*$/,"",process)
+            }
+
+            key=proto "|" port "|" process
+
+            if (!seen[key]++)
+              print port " | " proto " | " process
+          }
+        }' | sort -n
+      register: public_ports
+      changed_when: false
+      failed_when: false
+
+    ####################################################################
+    # DATABASE PORT SECURITY
+    ####################################################################
+
+    - name: Check public MySQL port
+      shell: |
+        ss -H -lnt | awk '{print $4}' \
+        | grep -Eq '(^0\.0\.0\.0:3306$|^\*:3306$|^\[::\]:3306$)'
+      register: mysql_public_check
+      changed_when: false
+      failed_when: false
+
+    - name: Check public PostgreSQL port
+      shell: |
+        ss -H -lnt | awk '{print $4}' \
+        | grep -Eq '(^0\.0\.0\.0:5432$|^\*:5432$|^\[::\]:5432$)'
+      register: postgres_public_check
+      changed_when: false
+      failed_when: false
+
+    - name: Set database security status
+      set_fact:
+        mysql_security: "{{ 'WARNING' if mysql_public_check.rc == 0 else 'OK' }}"
+        postgres_security: "{{ 'WARNING' if postgres_public_check.rc == 0 else 'OK' }}"
+
+    ####################################################################
+    # DOCKER PORTS
+    ####################################################################
+
+    - name: Get Docker published ports
+      shell: |
+        ss -H -lntup 2>/dev/null \
+        | grep 'docker-proxy' \
+        | awk '
+        {
+          local=$5
+          port=local
+          sub(/^.*:/,"",port)
+
+          if (port != "*" && port != "")
+            print port
+        }' \
+        | sort -n -u
+      register: docker_ports
+      changed_when: false
+      failed_when: false
+
+    ####################################################################
+    # NETWORK ERRORS
+    ####################################################################
+
+    - name: Get network errors and dropped packets
+      shell: |
+        cat /proc/net/dev | awk '
+        NR > 2 {
+          iface=$1
+          gsub(":","",iface)
+
+          if (iface !~ /^(lo|docker0|br-|veth)/) {
+            rx_errors=$4
+            rx_dropped=$5
+            tx_errors=$12
+            tx_dropped=$13
+
+            print iface \
+            " | RX_ERRORS=" rx_errors \
+            " | RX_DROPPED=" rx_dropped \
+            " | TX_ERRORS=" tx_errors \
+            " | TX_DROPPED=" tx_dropped
+          }
+        }'
+      register: network_errors
+      changed_when: false
+      failed_when: false
+
+    ####################################################################
+    # NETWORK ERROR STATUS
+    ####################################################################
+
+    - name: Count network errors
+      shell: |
+        cat /proc/net/dev | awk '
+        NR > 2 {
+          iface=$1
+          gsub(":","",iface)
+
+          if (iface !~ /^(lo|docker0|br-|veth)/) {
+
+            rx_errors += $4
+            rx_dropped += $5
+            tx_errors += $12
+            tx_dropped += $13
+          }
+        }
+
+        END {
+          print rx_errors + rx_dropped + tx_errors + tx_dropped
+        }'
+      register: network_error_count
+      changed_when: false
+      failed_when: false
+
+    - name: Set network interface status
+      set_fact:
+        interface_status: >-
+          {{
+            'OK'
+            if (network_error_count.stdout | int) == 0
+            else 'WARNING'
+          }}
+
+    ####################################################################
+    # PORT SECURITY STATUS
+    ####################################################################
+
+    - name: Set port security status
+      set_fact:
+        port_security_status: >-
+          {{
+            'WARNING'
+            if mysql_security == 'WARNING'
+            or postgres_security == 'WARNING'
+            else 'OK'
+          }}
+
+    ####################################################################
+    # OVERALL STATUS
+    ####################################################################
+
+    - name: Set overall network status
+      set_fact:
+        overall_network_status: >-
+          {{
+            'CRITICAL'
+            if internet_status == 'FAILED'
+            or dns_status == 'FAILED'
+            or ssh_status == 'FAILED'
+            else
+            'WARNING'
+            if port_security_status == 'WARNING'
+            or interface_status == 'WARNING'
+            else
+            'OK'
+          }}
+
+    ####################################################################
+    # DISPLAY REPORT
+    ####################################################################
+
+    - name: Display Advanced Network Health Report
+      debug:
+        msg:
+
+          - "================================================================"
+          - "NETWORK HEALTH & PORT SECURITY REPORT"
+          - "================================================================"
+
+          - "SERVER   : {{ inventory_hostname }}"
+          - "HOSTNAME : {{ hostname_output.stdout }}"
+
+          - ""
+
+          - "================ QUICK STATUS ================================"
+
+          - "Internet       : {{ internet_status }}"
+          - "DNS            : {{ dns_status }}"
+          - "SSH            : {{ ssh_status }}"
+          - "HTTP (80)      : {{ http_status }}"
+          - "HTTPS (443)    : {{ https_status }}"
+          - "Network NIC    : {{ interface_status }}"
+          - "Port Security  : {{ port_security_status }}"
+
+          - ""
+
+          - "================ SERVER NETWORK =============================="
+
+          - "PRIMARY IP:"
+          - "{{ primary_ip.stdout | trim if primary_ip.stdout | trim | length > 0 else 'Not detected' }}"
+
+          - ""
+
+          - "DEFAULT GATEWAY:"
+          - "{{ gateway_output.stdout | trim if gateway_output.stdout | trim | length > 0 else 'Not detected' }}"
+
+          - ""
+
+          - "DNS SERVERS:"
+          - "{{ dns_output.stdout | trim if dns_output.stdout | trim | length > 0 else 'Not detected' }}"
+
+          - ""
+
+          - "ACTIVE INTERFACES:"
+          - "{{ interfaces_output.stdout | trim if interfaces_output.stdout | trim | length > 0 else 'Not detected' }}"
+
+          - ""
+
+          - "================ IMPORTANT ACCESS ============================"
+
+          - "SSH PORT       : {{ ssh_port }}"
+          - "HTTP PORT      : 80 ({{ http_status }})"
+          - "HTTPS PORT     : 443 ({{ https_status }})"
+
+          - ""
+
+          - "================ PORTS CURRENTLY IN USE ======================"
+
+          - "TOTAL UNIQUE PORTS : {{ port_count.stdout | trim }}"
+
+          - ""
+
+          - "PORT     PROTOCOL   APPLICATION                  ACCESS"
+          - "------------------------------------------------------------"
+
+          - >-
+            {{
+              ports_output.stdout
+              if ports_output.stdout | trim | length > 0
+              else
+              'No listening ports detected.'
+            }}
+
+          - ""
+
+          - "ACCESS TYPE:"
+          - "PUBLIC     = Accessible from external networks"
+          - "PRIVATE    = Bound to a specific private interface"
+          - "LOCAL ONLY = Accessible only inside this server"
+
+          - ""
+
+          - "================ PUBLICLY EXPOSED PORTS ======================"
+
+          - "These ports may be accessible from the internet."
+
+          - ""
+
+          - "PORT | PROTOCOL | APPLICATION"
+          - "------------------------------------------------------------"
+
+          - >-
+            {{
+              public_ports.stdout
+              if public_ports.stdout | trim | length > 0
+              else
+              'No public listening ports detected.'
+            }}
+
+          - ""
+
+          - "================ DATABASE SECURITY ==========================="
+
+          - "MYSQL PORT 3306      : {{ mysql_security }}"
+          - "POSTGRESQL PORT 5432 : {{ postgres_security }}"
+
+          - ""
+
+          - >-
+            {{
+              'WARNING: MySQL is publicly listening on port 3306.'
+              if mysql_security == 'WARNING'
+              else
+              'MySQL is not publicly exposed.'
+            }}
+
+          - >-
+            {{
+              'WARNING: PostgreSQL is publicly listening on port 5432.'
+              if postgres_security == 'WARNING'
+              else
+              'PostgreSQL is not publicly exposed.'
+            }}
+
+          - ""
+
+          - "================ DOCKER PUBLISHED PORTS ======================"
+
+          - >-
+            {{
+              docker_ports.stdout
+              if docker_ports.stdout | trim | length > 0
+              else
+              'No Docker published ports detected.'
+            }}
+
+          - ""
+
+          - "================ NETWORK INTERFACE HEALTH ===================="
+
+          - >-
+            {{
+              network_errors.stdout
+              if network_errors.stdout | trim | length > 0
+              else
+              'No physical network interface information found.'
+            }}
+
+          - ""
+
+          - "================ ACTION REQUIRED ============================="
+
+          - >-
+            {{
+              'CRITICAL: Internet connectivity failed. Check gateway, VPS network and firewall.'
+              if internet_status == 'FAILED'
+              else
+              'Internet connectivity is healthy.'
+            }}
+
+          - >-
+            {{
+              'CRITICAL: DNS resolution failed. Check DNS configuration and systemd-resolved.'
+              if dns_status == 'FAILED'
+              else
+              'DNS resolution is healthy.'
+            }}
+
+          - >-
+            {{
+              'CRITICAL: SSH configured port is not listening. Check sshd immediately.'
+              if ssh_status == 'FAILED'
+              else
+              'SSH service and configured port are healthy.'
+            }}
+
+          - >-
+            {{
+              'WARNING: Public database ports detected. Restrict access using firewall or bind databases to localhost if public access is unnecessary.'
+              if port_security_status == 'WARNING'
+              else
+              'No monitored database port is publicly exposed.'
+            }}
+
+          - >-
+            {{
+              'WARNING: Network errors or dropped packets detected. Check interface, VPS network and traffic.'
+              if interface_status == 'WARNING'
+              else
+              'No network interface errors detected.'
+            }}
+
+          - ""
+
+          - "================================================================"
+
+          - "OVERALL NETWORK STATUS : {{ overall_network_status }}"
+
+          - >-
+            OVERALL REASON:
+            {{
+              'One or more critical network checks failed.'
+              if overall_network_status == 'CRITICAL'
+              else
+              'Network is working but security or interface warnings require review.'
+              if overall_network_status == 'WARNING'
+              else
+              'Network connectivity, DNS, SSH and monitored ports are healthy.'
+            }}
+
+          - "================================================================"

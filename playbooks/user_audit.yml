@@ -1,0 +1,404 @@
+---
+- name: STEP 9 - USER AND ACCOUNT HEALTH CHECK
+  hosts: all
+  become: true
+  gather_facts: true
+
+  tasks:
+
+    - name: Generate human readable user account health report
+      ansible.builtin.shell: |
+        #!/bin/bash
+
+        set +e
+
+        echo "================================================================"
+        echo "USER AND ACCOUNT HEALTH REPORT"
+        echo "================================================================"
+        echo ""
+        echo "SERVER   : {{ inventory_hostname }}"
+        echo "HOSTNAME : $(hostname)"
+        echo "DATE     : $(date '+%Y-%m-%d %H:%M:%S %Z')"
+        echo ""
+
+        echo "==================== QUICK SUMMARY ============================"
+
+        TOTAL_USERS=$(getent passwd | wc -l)
+
+        NORMAL_USERS=$(getent passwd | awk -F: '
+          ($3 >= 1000 && $3 < 65534) || $1 == "root"
+        ' | wc -l)
+
+        SYSTEM_USERS=$(getent passwd | awk -F: '
+          $3 < 1000 && $1 != "root"
+        ' | wc -l)
+
+        LOGIN_USERS=$(getent passwd | awk -F: '
+          (($3 >= 1000 && $3 < 65534) || $1 == "root") &&
+          $7 !~ /(nologin|false)$/
+          {print $1}
+        ' | wc -l)
+
+        LOCKED_USERS=0
+
+        while IFS=: read -r USERNAME PASSWORD UID GID GECOS HOME SHELL; do
+
+          if [ "$USERNAME" = "root" ] || [ "$UID" -ge 1000 ] && [ "$UID" -lt 65534 ]; then
+
+            if passwd -S "$USERNAME" 2>/dev/null | awk '{print $2}' | grep -q "L"; then
+              LOCKED_USERS=$((LOCKED_USERS + 1))
+            fi
+
+          fi
+
+        done < /etc/passwd
+
+        SSH_KEY_USERS=0
+
+        while IFS=: read -r USERNAME PASSWORD UID GID GECOS HOME SHELL; do
+
+          if [ "$USERNAME" = "root" ] || [ "$UID" -ge 1000 ] && [ "$UID" -lt 65534 ]; then
+
+            if [ -f "$HOME/.ssh/authorized_keys" ]; then
+              SSH_KEY_USERS=$((SSH_KEY_USERS + 1))
+            fi
+
+          fi
+
+        done < /etc/passwd
+
+        SUDO_USERS=$(getent group sudo 2>/dev/null | awk -F: '{print $4}' | tr ',' '\n' | sed '/^$/d' | wc -l)
+
+        CURRENT_LOGINS=$(who 2>/dev/null | awk '{print $1}' | sort -u | wc -l)
+
+        echo "TOTAL LOCAL ACCOUNTS       : $TOTAL_USERS"
+        echo "NORMAL / HUMAN USERS       : $NORMAL_USERS"
+        echo "SYSTEM / SERVICE ACCOUNTS  : $SYSTEM_USERS"
+        echo "USERS WITH LOGIN SHELL     : $LOGIN_USERS"
+        echo "LOCKED NORMAL USERS        : $LOCKED_USERS"
+        echo "USERS WITH SSH KEYS        : $SSH_KEY_USERS"
+        echo "USERS WITH SUDO ACCESS     : $SUDO_USERS"
+        echo "CURRENTLY LOGGED IN USERS  : $CURRENT_LOGINS"
+        echo ""
+
+        echo "================================================================"
+        echo "IMPORTANT USER ACCOUNTS"
+        echo "================================================================"
+        echo ""
+        echo "These are the accounts you should normally review."
+        echo "System/service accounts are not shown individually."
+        echo ""
+
+        while IFS=: read -r USERNAME PASSWORD UID GID GECOS HOME SHELL; do
+
+          if [ "$USERNAME" != "root" ] && { [ "$UID" -lt 1000 ] || [ "$UID" -ge 65534 ]; }; then
+            continue
+          fi
+
+          echo "----------------------------------------------------------------"
+          echo "USER : $USERNAME"
+          echo "----------------------------------------------------------------"
+
+          echo "UID          : $UID"
+          echo "HOME         : $HOME"
+          echo "SHELL        : $SHELL"
+
+          # ----------------------------------------------------------
+          # Login shell
+          # ----------------------------------------------------------
+
+          if echo "$SHELL" | grep -Eq "(nologin|false)$"; then
+            echo "LOGIN ACCESS : NO"
+            echo "REASON       : This account has a non-interactive shell."
+          else
+            echo "LOGIN ACCESS : YES"
+            echo "REASON       : This account has an interactive login shell."
+          fi
+
+          # ----------------------------------------------------------
+          # Account lock status
+          # ----------------------------------------------------------
+
+          ACCOUNT_STATUS=$(passwd -S "$USERNAME" 2>/dev/null | awk '{print $2}')
+
+          if [ "$ACCOUNT_STATUS" = "L" ]; then
+            echo "ACCOUNT      : LOCKED"
+          elif [ "$ACCOUNT_STATUS" = "P" ]; then
+            echo "ACCOUNT      : UNLOCKED"
+          elif [ "$ACCOUNT_STATUS" = "NP" ]; then
+            echo "ACCOUNT      : NO PASSWORD SET"
+          else
+            echo "ACCOUNT      : UNKNOWN"
+          fi
+
+          # ----------------------------------------------------------
+          # Home directory
+          # ----------------------------------------------------------
+
+          if [ -d "$HOME" ]; then
+            echo "HOME STATUS  : EXISTS"
+          else
+            echo "HOME STATUS  : MISSING"
+          fi
+
+          # ----------------------------------------------------------
+          # SSH keys
+          # ----------------------------------------------------------
+
+          if [ -f "$HOME/.ssh/authorized_keys" ]; then
+
+            KEY_COUNT=$(grep -cvE '^[[:space:]]*($|#)' "$HOME/.ssh/authorized_keys" 2>/dev/null)
+
+            echo "SSH ACCESS   : SSH KEY FOUND"
+            echo "SSH KEYS     : $KEY_COUNT"
+
+          else
+
+            echo "SSH ACCESS   : NO AUTHORIZED SSH KEY"
+
+          fi
+
+          # ----------------------------------------------------------
+          # Sudo access
+          # ----------------------------------------------------------
+
+          if [ "$USERNAME" = "root" ]; then
+
+            echo "SUDO ACCESS  : FULL ROOT ACCESS"
+
+          elif id -nG "$USERNAME" 2>/dev/null | tr ' ' '\n' | grep -qx "sudo"; then
+
+            echo "SUDO ACCESS  : YES"
+
+          else
+
+            echo "SUDO ACCESS  : NO"
+
+          fi
+
+          # ----------------------------------------------------------
+          # Currently logged in
+          # ----------------------------------------------------------
+
+          if who 2>/dev/null | awk '{print $1}' | grep -qx "$USERNAME"; then
+
+            echo "CURRENT LOGIN: YES"
+
+          else
+
+            echo "CURRENT LOGIN: NO"
+
+          fi
+
+          # ----------------------------------------------------------
+          # Last login
+          # ----------------------------------------------------------
+
+          LAST_LOGIN=$(lastlog -u "$USERNAME" 2>/dev/null | tail -n 1)
+
+          if echo "$LAST_LOGIN" | grep -qi "Never logged in"; then
+
+            echo "LAST LOGIN   : NEVER LOGGED IN"
+
+          elif [ -n "$LAST_LOGIN" ]; then
+
+            LAST_LOGIN_TEXT=$(echo "$LAST_LOGIN" | sed "s/^$USERNAME[[:space:]]*//")
+
+            echo "LAST LOGIN   : $LAST_LOGIN_TEXT"
+
+          else
+
+            echo "LAST LOGIN   : INFORMATION NOT AVAILABLE"
+
+          fi
+
+          # ----------------------------------------------------------
+          # Running processes
+          # ----------------------------------------------------------
+
+          PROCESS_COUNT=$(ps -u "$USERNAME" --no-headers 2>/dev/null | wc -l)
+
+          echo "PROCESSES    : $PROCESS_COUNT RUNNING"
+
+          if [ "$PROCESS_COUNT" -gt 0 ]; then
+
+            echo "TOP PROCESSES:"
+
+            ps -u "$USERNAME" \
+              -o pid=,ppid=,stat=,%cpu=,%mem=,etime=,comm= \
+              --sort=-%cpu 2>/dev/null \
+              | head -n 5 \
+              | awk '
+                {
+                  printf "  PID=%s | CPU=%s%% | MEM=%s%% | TIME=%s | COMMAND=%s\n",
+                  $1, $4, $5, $6, $7
+                }
+              '
+
+          fi
+
+          echo ""
+
+        done < /etc/passwd
+
+        echo "================================================================"
+        echo "USERS CURRENTLY LOGGED IN"
+        echo "================================================================"
+        echo ""
+
+        CURRENT_USER_LIST=$(who 2>/dev/null)
+
+        if [ -n "$CURRENT_USER_LIST" ]; then
+
+          echo "$CURRENT_USER_LIST" | awk '
+            {
+              printf "USER: %-20s TERMINAL: %-12s FROM: %s\n",
+              $1, $2, $5
+            }
+          '
+
+        else
+
+          echo "No interactive user session currently detected."
+
+        fi
+
+        echo ""
+
+        echo "================================================================"
+        echo "SUDO / ADMINISTRATIVE ACCESS"
+        echo "================================================================"
+        echo ""
+
+        echo "ROOT USER:"
+        echo "  root"
+
+        echo ""
+
+        echo "SUDO GROUP USERS:"
+
+        SUDO_LIST=$(getent group sudo 2>/dev/null | awk -F: '{print $4}')
+
+        if [ -n "$SUDO_LIST" ]; then
+
+          echo "$SUDO_LIST" | tr ',' '\n' | while read -r USERNAME; do
+
+            if [ -n "$USERNAME" ]; then
+              echo "  $USERNAME"
+            fi
+
+          done
+
+        else
+
+          echo "  No additional users found in sudo group."
+
+        fi
+
+        echo ""
+
+        echo "================================================================"
+        echo "ACCOUNTS THAT NEED ATTENTION"
+        echo "================================================================"
+        echo ""
+
+        ISSUE_FOUND=0
+
+        while IFS=: read -r USERNAME PASSWORD UID GID GECOS HOME SHELL; do
+
+          if [ "$USERNAME" != "root" ] && { [ "$UID" -lt 1000 ] || [ "$UID" -ge 65534 ]; }; then
+            continue
+          fi
+
+          # Missing home directory
+
+          if [ "$USERNAME" != "root" ] && [ ! -d "$HOME" ]; then
+
+            echo "WARNING: $USERNAME"
+            echo "  ISSUE : Home directory does not exist."
+            echo "  HOME  : $HOME"
+            echo ""
+
+            ISSUE_FOUND=1
+
+          fi
+
+          # Login shell but locked account
+
+          ACCOUNT_STATUS=$(passwd -S "$USERNAME" 2>/dev/null | awk '{print $2}')
+
+          if ! echo "$SHELL" | grep -Eq "(nologin|false)$"; then
+
+            if [ "$ACCOUNT_STATUS" = "L" ]; then
+
+              echo "INFO: $USERNAME"
+              echo "  STATUS : Account is locked."
+              echo "  NOTE   : Interactive login shell exists, but password login is locked."
+              echo ""
+
+            fi
+
+          fi
+
+        done < /etc/passwd
+
+        if [ "$ISSUE_FOUND" -eq 0 ]; then
+
+          echo "OK: No missing home directory detected for normal users."
+
+        fi
+
+        echo ""
+
+        echo "================================================================"
+        echo "HOW TO READ THIS REPORT"
+        echo "================================================================"
+        echo ""
+        echo "LOGIN ACCESS : YES"
+        echo "  The user has a normal interactive shell."
+        echo ""
+        echo "ACCOUNT : LOCKED"
+        echo "  Password authentication for the account is locked."
+        echo ""
+        echo "SSH ACCESS : SSH KEY FOUND"
+        echo "  The user may be able to authenticate using an authorized SSH key."
+        echo ""
+        echo "SUDO ACCESS : YES"
+        echo "  The user can execute administrative commands using sudo."
+        echo ""
+        echo "CURRENT LOGIN : YES"
+        echo "  The user currently has an active login session."
+        echo ""
+        echo "PROCESSES"
+        echo "  Shows how many processes are currently owned by the user."
+        echo ""
+
+        echo "================================================================"
+        echo "FINAL USER ACCOUNT STATUS"
+        echo "================================================================"
+        echo ""
+
+        if [ "$ISSUE_FOUND" -eq 0 ]; then
+
+          echo "STATUS : OK"
+          echo "REASON : No major normal-user account problem was detected."
+
+        else
+
+          echo "STATUS : WARNING"
+          echo "REASON : One or more user accounts require review."
+
+        fi
+
+        echo ""
+        echo "================================================================"
+
+      args:
+        executable: /bin/bash
+
+      register: user_health_report
+      changed_when: false
+
+    - name: Display user account health report
+      ansible.builtin.debug:
+        msg: "{{ user_health_report.stdout }}"

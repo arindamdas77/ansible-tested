@@ -1,0 +1,364 @@
+---
+- name: Security and Server Health Check
+  hosts: servers
+  gather_facts: true
+  become: true
+
+  tasks:
+
+    # ==========================================================
+    # BASIC SECURITY INFORMATION
+    # ==========================================================
+
+    - name: Get hostname
+      command: hostname
+      register: hostname_output
+      changed_when: false
+
+    - name: Check uptime
+      command: uptime -p
+      register: uptime_output
+      changed_when: false
+
+    - name: Check pending reboot
+      shell: |
+        if [ -f /var/run/reboot-required ]; then
+          echo "REBOOT REQUIRED"
+        else
+          echo "NO REBOOT REQUIRED"
+        fi
+      register: reboot_output
+      changed_when: false
+
+    # ==========================================================
+    # CURRENT LOGGED IN USERS
+    # ==========================================================
+
+    - name: Check currently logged in users
+      shell: |
+        who
+      register: logged_users
+      changed_when: false
+      failed_when: false
+
+    - name: Check recent successful logins
+      shell: |
+        last -n 10
+      register: recent_logins
+      changed_when: false
+      failed_when: false
+
+    # ==========================================================
+    # ROOT LEVEL USERS
+    # ==========================================================
+
+    - name: Check UID 0 users
+      shell: |
+        awk -F: '$3 == 0 {print $1}' /etc/passwd
+      register: uid_zero_users
+      changed_when: false
+
+    # ==========================================================
+    # SSH SECURITY
+    # ==========================================================
+
+    - name: Get SSH configuration
+      shell: |
+        SSH_CONFIG="/etc/ssh/sshd_config"
+
+        if [ ! -f "$SSH_CONFIG" ]; then
+          echo "SSH configuration file not found"
+          exit 0
+        fi
+
+        echo "PermitRootLogin:"
+        grep -iE '^[[:space:]]*PermitRootLogin' "$SSH_CONFIG" | tail -n 1 || echo "not explicitly configured"
+
+        echo ""
+
+        echo "PasswordAuthentication:"
+        grep -iE '^[[:space:]]*PasswordAuthentication' "$SSH_CONFIG" | tail -n 1 || echo "not explicitly configured"
+
+        echo ""
+
+        echo "SSH Port:"
+        grep -iE '^[[:space:]]*Port' "$SSH_CONFIG" | tail -n 1 || echo "default port 22"
+      register: ssh_security
+      changed_when: false
+      failed_when: false
+
+    - name: Check failed SSH logins
+      shell: |
+        if [ -f /var/log/auth.log ]; then
+          echo "FAILED SSH LOGIN ATTEMPTS (LAST 24 HOURS):"
+          grep -Ei "Failed password|Invalid user|authentication failure" /var/log/auth.log \
+            | awk -v date="$(date '+%b %e')" '$0 ~ date' \
+            | wc -l
+        else
+          echo "FAILED SSH LOGIN ATTEMPTS (LAST 24 HOURS):"
+          journalctl --since "24 hours ago" \
+            | grep -Ei "Failed password|Invalid user|authentication failure" \
+            | wc -l
+        fi
+      register: failed_ssh_logins
+      changed_when: false
+      failed_when: false
+
+    # ==========================================================
+    # FIREWALL
+    # ==========================================================
+
+    - name: Check UFW firewall
+      shell: |
+        if command -v ufw >/dev/null 2>&1; then
+          ufw status
+        else
+          echo "UFW NOT INSTALLED"
+        fi
+      register: ufw_status
+      changed_when: false
+      failed_when: false
+
+    # ==========================================================
+    # PUBLIC LISTENING PORTS
+    # ==========================================================
+
+    - name: Get public listening ports
+      shell: |
+        ss -tulpenH 2>/dev/null \
+        | awk '
+          {
+            proto=$1
+            addr=$5
+            process=$NF
+
+            if (
+              addr ~ /^0\.0\.0\.0:/ ||
+              addr ~ /^\*:/ ||
+              addr ~ /^\[::\]:/
+            ) {
+              print proto " | " addr " | " process
+            }
+          }
+        ' | sort -u
+      register: public_ports
+      changed_when: false
+      failed_when: false
+
+    - name: Count public listening ports
+      shell: |
+        ss -tulpenH 2>/dev/null \
+        | awk '
+          {
+            addr=$5
+
+            if (
+              addr ~ /^0\.0\.0\.0:/ ||
+              addr ~ /^\*:/ ||
+              addr ~ /^\[::\]:/
+            ) {
+              print addr
+            }
+          }
+        ' \
+        | sed 's/.*://' \
+        | sort -u \
+        | wc -l
+      register: public_port_count
+      changed_when: false
+      failed_when: false
+
+    # ==========================================================
+    # FAILED SERVICES
+    # ==========================================================
+
+    - name: Check failed systemd services
+      shell: |
+        systemctl --failed --no-legend --no-pager 2>/dev/null \
+        | awk '{print $1}' \
+        | grep -v '^$' \
+        || true
+      register: failed_services
+      changed_when: false
+
+    # ==========================================================
+    # DISK SPACE
+    # ==========================================================
+
+    - name: Check disk usage
+      shell: |
+        df -P -x tmpfs -x devtmpfs \
+        | awk 'NR==1 || $5+0 >= 80'
+      register: disk_warning
+      changed_when: false
+      failed_when: false
+
+    # ==========================================================
+    # RECENT SYSTEM ERRORS
+    # ==========================================================
+
+    - name: Check recent system errors
+      shell: |
+        journalctl -p 3 -n 10 --no-pager 2>/dev/null || true
+      register: system_errors
+      changed_when: false
+      failed_when: false
+
+    # ==========================================================
+    # CALCULATE SECURITY STATUS
+    # ==========================================================
+
+    - name: Set failed service count
+      set_fact:
+        failed_service_count: "{{ failed_services.stdout_lines | length }}"
+
+    - name: Set failed SSH login count
+      set_fact:
+        failed_ssh_count: "{{ failed_ssh_logins.stdout_lines[-1] | default('0') | int }}"
+
+    - name: Calculate overall security status
+      set_fact:
+        security_status: >-
+          {{
+            'CRITICAL'
+            if (failed_service_count | int > 0)
+            else
+            (
+              'WARNING'
+              if (
+                failed_ssh_count | int > 20
+                or reboot_output.stdout == 'REBOOT REQUIRED'
+              )
+              else 'OK'
+            )
+          }}
+
+    - name: Calculate overall security reason
+      set_fact:
+        security_reason: >-
+          {{
+            'CRITICAL: One or more system services are failed. Check the FAILED SERVICES section.'
+            if (failed_service_count | int > 0)
+            else
+            (
+              'WARNING: High number of failed SSH login attempts detected. Review SSH security.'
+              if (failed_ssh_count | int > 20)
+              else
+              (
+                'WARNING: Server reboot is required after system updates.'
+                if reboot_output.stdout == 'REBOOT REQUIRED'
+                else
+                'OK: No major security or server health problem detected.'
+              )
+            )
+          }}
+
+    # ==========================================================
+    # FINAL REPORT
+    # ==========================================================
+
+    - name: Display Security and Server Health Report
+      debug:
+        msg:
+          - "============================================================"
+          - "SECURITY & SERVER HEALTH REPORT"
+          - "============================================================"
+          - "SERVER   : {{ inventory_hostname }}"
+          - "HOSTNAME : {{ hostname_output.stdout }}"
+          - "UPTIME   : {{ uptime_output.stdout }}"
+          - ""
+          - "================ REBOOT STATUS ===================="
+          - "{{ reboot_output.stdout }}"
+          - ""
+          - "================ CURRENT USERS ===================="
+          - "{{ logged_users.stdout if logged_users.stdout != '' else 'No interactive users currently logged in.' }}"
+          - ""
+          - "================ RECENT LOGIN HISTORY ============="
+          - "{{ recent_logins.stdout }}"
+          - ""
+          - "================ ROOT LEVEL USERS ================="
+          - "USERS WITH UID 0:"
+          - "{{ uid_zero_users.stdout }}"
+          - ""
+          - "================ SSH SECURITY ====================="
+          - "{{ ssh_security.stdout }}"
+          - ""
+          - "================ FAILED SSH LOGINS ================"
+          - "FAILED ATTEMPTS (LAST 24 HOURS): {{ failed_ssh_count }}"
+          - >-
+            {{
+              'STATUS: OK - No failed SSH login attempts detected.'
+              if failed_ssh_count | int == 0
+              else
+              (
+                'STATUS: WARNING - Some failed SSH login attempts detected. This may be normal or may indicate unauthorized access attempts.'
+                if failed_ssh_count | int <= 20
+                else
+                'STATUS: WARNING - High number of failed SSH login attempts detected. Investigate possible brute-force activity.'
+              )
+            }}
+          - ""
+          - "================ FIREWALL STATUS =================="
+          - "{{ ufw_status.stdout }}"
+          - ""
+          - "================ PUBLIC OPEN PORTS ================"
+          - "TOTAL PUBLIC LISTENING PORTS: {{ public_port_count.stdout }}"
+          - ""
+          - "PROTOCOL | LISTENING ADDRESS | PROCESS"
+          - "------------------------------------------------------------"
+          - "{{ public_ports.stdout if public_ports.stdout != '' else 'No public listening ports detected.' }}"
+          - ""
+          - "================ DISK WARNING CHECK ==============="
+          - >-
+            {{
+              disk_warning.stdout
+              if disk_warning.stdout_lines | length > 1
+              else
+              'OK: No disk filesystem is currently above 80% usage.'
+            }}
+          - ""
+          - "================ FAILED SERVICES =================="
+          - >-
+            {{
+              failed_services.stdout
+              if failed_service_count | int > 0
+              else
+              'OK: No failed systemd services detected.'
+            }}
+          - ""
+          - "================ RECENT SYSTEM ERRORS ============="
+          - >-
+            {{
+              system_errors.stdout
+              if system_errors.stdout != ''
+              else
+              'OK: No recent critical system errors found.'
+            }}
+          - ""
+          - "================ QUICK TROUBLESHOOTING ============"
+          - >-
+            {{
+              'FAILED SERVICES: Run systemctl status <service> and journalctl -u <service> -n 100'
+              if failed_service_count | int > 0
+              else
+              'FAILED SERVICES: No issue detected.'
+            }}
+          - >-
+            {{
+              'SSH SECURITY: Check /var/log/auth.log and consider reviewing SSH access.'
+              if failed_ssh_count | int > 20
+              else
+              'SSH SECURITY: No major issue detected.'
+            }}
+          - >-
+            {{
+              'REBOOT: Restart the server during a maintenance window.'
+              if reboot_output.stdout == 'REBOOT REQUIRED'
+              else
+              'REBOOT: No reboot currently required.'
+            }}
+          - ""
+          - "============================================================"
+          - "OVERALL SECURITY STATUS : {{ security_status }}"
+          - "OVERALL REASON          : {{ security_reason }}"
+          - "============================================================"
