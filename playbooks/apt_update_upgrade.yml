@@ -1,0 +1,157 @@
+---
+- name: APT Update and Upgrade - All Servers
+  hosts: servers
+  become: true
+  gather_facts: true
+
+  tasks:
+
+    # ============================================================
+    # START INFORMATION
+    # ============================================================
+
+    - name: Display server update start
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "APT UPDATE AND UPGRADE"
+          - "============================================================"
+          - "SERVER   : {{ inventory_hostname }}"
+          - "HOSTNAME : {{ ansible_hostname }}"
+          - "OS       : {{ ansible_distribution }} {{ ansible_distribution_version }}"
+          - "============================================================"
+
+    # ============================================================
+    # APT UPDATE
+    # ============================================================
+
+    - name: Update APT package cache
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 0
+      register: apt_update_result
+
+    # ============================================================
+    # CHECK AVAILABLE UPDATES
+    # ============================================================
+
+    - name: Check available package upgrades
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null | tail -n +2 || true
+      register: available_updates
+      changed_when: false
+
+    # ============================================================
+    # UPGRADE PACKAGES
+    # ============================================================
+
+    - name: Upgrade all packages
+      ansible.builtin.apt:
+        upgrade: safe
+        update_cache: false
+      register: apt_upgrade_result
+
+    # ============================================================
+    # CHECK REBOOT REQUIREMENT
+    # ============================================================
+
+    - name: Check if reboot is required
+      ansible.builtin.stat:
+        path: /var/run/reboot-required
+      register: reboot_required
+
+    # ============================================================
+    # GET KERNEL VERSION
+    # ============================================================
+
+    - name: Get running kernel version
+      ansible.builtin.command: uname -r
+      register: running_kernel
+      changed_when: false
+
+    # ============================================================
+    # CHECK AVAILABLE UPDATES AFTER UPGRADE
+    # ============================================================
+
+    - name: Check remaining package upgrades
+      ansible.builtin.shell: |
+        apt list --upgradable 2>/dev/null | tail -n +2 || true
+      register: remaining_updates
+      changed_when: false
+
+    # ============================================================
+    # FINAL REPORT
+    # ============================================================
+
+    - name: Display update summary
+      ansible.builtin.debug:
+        msg:
+          - "============================================================"
+          - "APT UPDATE AND UPGRADE SUMMARY"
+          - "============================================================"
+
+          - "SERVER : {{ inventory_hostname }}"
+          - "HOST   : {{ ansible_hostname }}"
+
+          - ""
+
+          - "APT CACHE UPDATE"
+          - >-
+            {{
+              '✓ SUCCESS - Package information updated.'
+              if not apt_update_result.failed
+              else
+              '✗ FAILED - Unable to update package information.'
+            }}
+
+          - ""
+
+          - "PACKAGE UPGRADE"
+          - >-
+            {{
+              '✓ PACKAGES UPGRADED'
+              if apt_upgrade_result.changed
+              else
+              '✓ NO PACKAGE UPGRADES REQUIRED'
+            }}
+
+          - ""
+
+          - "REBOOT STATUS"
+          - >-
+            {{
+              '⚠ REBOOT REQUIRED - Restart this server to complete updates.'
+              if reboot_required.stat.exists
+              else
+              '✓ NO REBOOT REQUIRED'
+            }}
+
+          - ""
+
+          - "RUNNING KERNEL"
+          - "{{ running_kernel.stdout }}"
+
+          - ""
+
+          - "REMAINING UPDATES"
+
+          - >-
+            {{
+              remaining_updates.stdout
+              if remaining_updates.stdout | trim | length > 0
+              else
+              '✓ System is fully updated.'
+            }}
+
+          - ""
+
+          - "============================================================"
+          - "FINAL STATUS"
+          - >-
+            {{
+              'WARNING - Reboot required.'
+              if reboot_required.stat.exists
+              else
+              'OK - Update process completed successfully.'
+            }}
+          - "============================================================"

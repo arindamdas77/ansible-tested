@@ -1,0 +1,302 @@
+---
+- name: Step 6 - Simple Service and Application Health Check
+  hosts: servers
+  become: true
+  gather_facts: true
+
+  tasks:
+
+    # ============================================================
+    # SYSTEM SERVICES
+    # ============================================================
+
+    - name: Check important installed services
+      ansible.builtin.shell: |
+        services="ssh sshd apache2 mysql mariadb postgresql docker jenkins"
+
+        for service in $services; do
+          if systemctl list-unit-files "${service}.service" --no-legend 2>/dev/null | grep -q "^${service}.service"; then
+            status=$(systemctl is-active "$service" 2>/dev/null || true)
+            echo "$service|$status"
+          fi
+        done
+      register: services_raw
+      changed_when: false
+
+    - name: Find running services
+      ansible.builtin.shell: |
+        echo '{{ services_raw.stdout }}' | awk -F'|' '$2=="active" {print $1}'
+      register: running_services
+      changed_when: false
+
+    - name: Find stopped services
+      ansible.builtin.shell: |
+        echo '{{ services_raw.stdout }}' | awk -F'|' '$2!="active" {print $1 "|" $2}'
+      register: stopped_services
+      changed_when: false
+
+    - name: Find failed system services
+      ansible.builtin.shell: |
+        systemctl list-units \
+          --type=service \
+          --state=failed \
+          --no-legend \
+          --plain \
+          --no-pager 2>/dev/null | \
+        awk 'NF >= 4 {print $1}' || true
+      register: failed_services
+      changed_when: false
+
+    # ============================================================
+    # PHP-FPM
+    # ============================================================
+
+    - name: Check PHP-FPM services
+      ansible.builtin.shell: |
+        found=0
+
+        while read -r service; do
+          if [ -n "$service" ]; then
+            found=1
+            status=$(systemctl is-active "$service" 2>/dev/null || true)
+            echo "${service%.service}|$status"
+          fi
+        done < <(
+          systemctl list-unit-files \
+            --type=service \
+            --no-legend 2>/dev/null | \
+          awk '{print $1}' | \
+          grep -E '^php[0-9.]+-fpm.service$' || true
+        )
+
+        if [ "$found" = "0" ]; then
+          echo "NONE"
+        fi
+      args:
+        executable: /bin/bash
+      register: php_fpm_raw
+      changed_when: false
+
+    # ============================================================
+    # PM2
+    # ============================================================
+
+    - name: Find PM2 users
+      ansible.builtin.shell: |
+        ps -eo user:50,args:500 2>/dev/null | \
+        grep -E '[P][M]2: God Daemon|PM2 v' | \
+        awk '{print $1}' | \
+        sort -u || true
+      register: pm2_users
+      changed_when: false
+
+    - name: Check PM2 applications
+      ansible.builtin.shell: |
+        users=$(ps -eo user:50,args:500 2>/dev/null | \
+          grep -E '[P][M]2: God Daemon|PM2 v' | \
+          awk '{print $1}' | \
+          sort -u)
+
+        if [ -z "$users" ]; then
+          echo "NO_PM2"
+          exit 0
+        fi
+
+        for user in $users; do
+
+          home_dir=$(getent passwd "$user" | cut -d: -f6)
+
+          if [ -z "$home_dir" ]; then
+            continue
+          fi
+
+          if [ "$user" = "root" ]; then
+            output=$(HOME="$home_dir" pm2 jlist 2>/dev/null || true)
+          else
+            output=$(sudo -u "$user" HOME="$home_dir" pm2 jlist 2>/dev/null || true)
+          fi
+
+          echo "$output" | grep -oE '"name":"[^"]+"|"status":"[^"]+"' | \
+          paste - - | \
+          sed "s/\"name\":\"//;s/\",\"status\":\"/|/;s/\"//g" | \
+          while IFS='|' read -r name status; do
+            echo "$user|$name|$status"
+          done
+
+        done
+      args:
+        executable: /bin/bash
+      register: pm2_raw
+      changed_when: false
+
+    - name: Find unhealthy PM2 applications
+      ansible.builtin.shell: |
+        if [ "{{ pm2_raw.stdout | trim }}" = "NO_PM2" ]; then
+          exit 0
+        fi
+
+        echo '{{ pm2_raw.stdout }}' | \
+        awk -F'|' '$3!="online" {print $0}'
+      register: pm2_problems
+      changed_when: false
+
+    # ============================================================
+    # NETWORK
+    # ============================================================
+
+    - name: Count listening ports
+      ansible.builtin.shell: |
+        ss -lntuH 2>/dev/null | wc -l
+      register: listening_port_count
+      changed_when: false
+
+    # ============================================================
+    # CALCULATE COUNTS
+    # ============================================================
+
+    - name: Calculate service counts
+      ansible.builtin.set_fact:
+        running_count: "{{ running_services.stdout_lines | length }}"
+        stopped_count: "{{ stopped_services.stdout_lines | length }}"
+        failed_count: "{{ failed_services.stdout_lines | length }}"
+        pm2_problem_count: "{{ pm2_problems.stdout_lines | length }}"
+
+    # ============================================================
+    # DETERMINE OVERALL STATUS
+    # ============================================================
+
+    - name: Determine overall status
+      ansible.builtin.set_fact:
+        overall_status: >-
+          {{
+            'CRITICAL'
+            if (failed_services.stdout | trim | length > 0)
+            else
+            'WARNING'
+            if (stopped_services.stdout | trim | length > 0)
+            or (pm2_problems.stdout | trim | length > 0)
+            else
+            'OK'
+          }}
+
+    # ============================================================
+    # FINAL SIMPLE OUTPUT
+    # ============================================================
+
+    - name: Display simple server health report
+      ansible.builtin.debug:
+        msg:
+
+          - "============================================================"
+          - "SERVER HEALTH SUMMARY"
+          - "============================================================"
+
+          - "SERVER   : {{ inventory_hostname }}"
+          - "HOSTNAME : {{ ansible_hostname }}"
+
+          - ""
+
+          - "================ OVERALL STATUS ================="
+
+          - >-
+            {{
+              '🟢 OK - Server services are healthy.'
+              if overall_status == 'OK'
+              else
+              '🟡 WARNING - Some items need attention.'
+              if overall_status == 'WARNING'
+              else
+              '🔴 CRITICAL - Failed service detected.'
+            }}
+
+          - ""
+
+          - "================ SYSTEM SERVICES ================"
+
+          - "Running : {{ running_count }}"
+          - "Stopped : {{ stopped_count }}"
+          - "Failed  : {{ failed_count }}"
+
+          - ""
+
+          - >-
+            {{
+              '✓ Running services: ' ~
+              (running_services.stdout_lines | join(', '))
+              if running_services.stdout | trim | length > 0
+              else
+              'No monitored services found.'
+            }}
+
+          - ""
+
+          - "================ PHP-FPM ========================"
+
+          - >-
+            {{
+              'No PHP-FPM installed.'
+              if php_fpm_raw.stdout | trim == 'NONE'
+              else
+              php_fpm_raw.stdout
+            }}
+
+          - ""
+
+          - "================ PM2 APPLICATIONS ==============="
+
+          - >-
+            {{
+              'PM2 not running on this server.'
+              if pm2_raw.stdout | trim == 'NO_PM2'
+              else
+              pm2_raw.stdout
+            }}
+
+          - ""
+
+          - "================ NETWORK ========================"
+
+          - "Listening Ports : {{ listening_port_count.stdout }}"
+
+          - ""
+
+          - "================ ACTION REQUIRED ================"
+
+          - >-
+            {{
+              '✓ No action required.'
+              if overall_status == 'OK'
+              else
+              'CHECK STOPPED SERVICES:\n' ~
+              stopped_services.stdout ~
+              '\n\nUse:\nsystemctl status <service>\njournalctl -u <service> -n 50'
+              if stopped_services.stdout | trim | length > 0
+              else
+              ''
+            }}
+
+          - >-
+            {{
+              'CHECK FAILED SERVICES:\n' ~
+              failed_services.stdout ~
+              '\n\nUse:\nsystemctl status <service>\njournalctl -u <service> -n 100'
+              if failed_services.stdout | trim | length > 0
+              else
+              ''
+            }}
+
+          - >-
+            {{
+              'CHECK PM2 APPLICATIONS:\n' ~
+              pm2_problems.stdout ~
+              '\n\nUse:\npm2 logs <application> --lines 50'
+              if pm2_problems.stdout | trim | length > 0
+              else
+              ''
+            }}
+
+          - ""
+
+          - "============================================================"
+          - "FINAL RESULT : {{ overall_status }}"
+          - "============================================================"

@@ -1,0 +1,210 @@
+---
+- name: Step 7 - SSL Certificate Health Check
+  hosts: servers
+  become: true
+  gather_facts: false
+
+  tasks:
+
+    # ============================================================
+    # FIND LETSENCRYPT CERTIFICATES
+    # ============================================================
+
+    - name: Find installed SSL certificates
+      ansible.builtin.shell: |
+        if [ -d /etc/letsencrypt/live ]; then
+          find /etc/letsencrypt/live \
+            -maxdepth 2 \
+            -name cert.pem \
+            -type f 2>/dev/null
+        fi
+      register: ssl_cert_files
+      changed_when: false
+
+    # ============================================================
+    # CHECK CERTIFICATE DETAILS
+    # ============================================================
+
+    - name: Check SSL certificate expiry
+      ansible.builtin.shell: |
+        for cert in {{ ssl_cert_files.stdout_lines | map('quote') | join(' ') }}; do
+
+          if [ -f "$cert" ]; then
+
+            domain=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | \
+              sed -n 's/.*CN *= *//p')
+
+            expiry=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null | \
+              cut -d= -f2)
+
+            expiry_epoch=$(date -d "$expiry" +%s 2>/dev/null)
+            current_epoch=$(date +%s)
+
+            days_remaining=$(( (expiry_epoch - current_epoch) / 86400 ))
+
+            echo "$domain|$expiry|$days_remaining|$cert"
+
+          fi
+
+        done
+      register: ssl_raw
+      changed_when: false
+      when: ssl_cert_files.stdout | trim | length > 0
+
+    # ============================================================
+    # FIND CRITICAL CERTIFICATES
+    # LESS THAN 7 DAYS
+    # ============================================================
+
+    - name: Find critical SSL certificates
+      ansible.builtin.shell: |
+        echo '{{ ssl_raw.stdout | default("") }}' | \
+        awk -F'|' '$3 < 7 {print $1 "|" $2 "|" $3}'
+      register: ssl_critical
+      changed_when: false
+
+    # ============================================================
+    # FIND WARNING CERTIFICATES
+    # LESS THAN 30 DAYS
+    # ============================================================
+
+    - name: Find SSL certificates expiring soon
+      ansible.builtin.shell: |
+        echo '{{ ssl_raw.stdout | default("") }}' | \
+        awk -F'|' '$3 >= 7 && $3 < 30 {print $1 "|" $2 "|" $3}'
+      register: ssl_warning
+      changed_when: false
+
+    # ============================================================
+    # FIND HEALTHY CERTIFICATES
+    # ============================================================
+
+    - name: Find healthy SSL certificates
+      ansible.builtin.shell: |
+        echo '{{ ssl_raw.stdout | default("") }}' | \
+        awk -F'|' '$3 >= 30 {print $1 "|" $2 "|" $3}'
+      register: ssl_ok
+      changed_when: false
+
+    # ============================================================
+    # CALCULATE COUNTS
+    # ============================================================
+
+    - name: Calculate SSL certificate counts
+      ansible.builtin.set_fact:
+        ssl_total_count: "{{ ssl_raw.stdout_lines | default([]) | length }}"
+        ssl_ok_count: "{{ ssl_ok.stdout_lines | length }}"
+        ssl_warning_count: "{{ ssl_warning.stdout_lines | length }}"
+        ssl_critical_count: "{{ ssl_critical.stdout_lines | length }}"
+
+    # ============================================================
+    # DETERMINE OVERALL SSL STATUS
+    # ============================================================
+
+    - name: Determine overall SSL status
+      ansible.builtin.set_fact:
+        ssl_status: >-
+          {{
+            'CRITICAL'
+            if ssl_critical.stdout | trim | length > 0
+            else
+            'WARNING'
+            if ssl_warning.stdout | trim | length > 0
+            else
+            'OK'
+          }}
+
+    # ============================================================
+    # DISPLAY SIMPLE SSL REPORT
+    # ============================================================
+
+    - name: Display SSL certificate health report
+      ansible.builtin.debug:
+        msg:
+
+          - "============================================================"
+          - "SSL CERTIFICATE HEALTH SUMMARY"
+          - "============================================================"
+
+          - "SERVER : {{ inventory_hostname }}"
+
+          - ""
+
+          - "================ OVERALL STATUS ================="
+
+          - >-
+            {{
+              '🟢 OK - All SSL certificates are healthy.'
+              if ssl_status == 'OK'
+              else
+              '🟡 WARNING - Some SSL certificates expire within 30 days.'
+              if ssl_status == 'WARNING'
+              else
+              '🔴 CRITICAL - SSL certificate expires within 7 days or has expired.'
+            }}
+
+          - ""
+
+          - "================ CERTIFICATE SUMMARY ============"
+
+          - "TOTAL CERTIFICATES : {{ ssl_total_count }}"
+          - "HEALTHY (30+ DAYS) : {{ ssl_ok_count }}"
+          - "WARNING (<30 DAYS) : {{ ssl_warning_count }}"
+          - "CRITICAL (<7 DAYS) : {{ ssl_critical_count }}"
+
+          - ""
+
+          - "================ CRITICAL CERTIFICATES =========="
+
+          - >-
+            {{
+              ssl_critical.stdout
+              if ssl_critical.stdout | trim | length > 0
+              else
+              '✓ No critical SSL certificates.'
+            }}
+
+          - ""
+
+          - "================ EXPIRING SOON =================="
+
+          - >-
+            {{
+              ssl_warning.stdout
+              if ssl_warning.stdout | trim | length > 0
+              else
+              '✓ No SSL certificates expiring soon.'
+            }}
+
+          - ""
+
+          - "================ HEALTHY CERTIFICATES ==========="
+
+          - >-
+            {{
+              ssl_ok.stdout
+              if ssl_ok.stdout | trim | length > 0
+              else
+              'No certificates found.'
+            }}
+
+          - ""
+
+          - "================ ACTION REQUIRED ================"
+
+          - >-
+            {{
+              'CHECK CERTBOT RENEWAL:\ncertbot renew --dry-run\n\nCHECK FAILED CERTBOT SERVICE:\nsystemctl status certbot.service\njournalctl -u certbot.service -n 100 --no-pager'
+              if ssl_status == 'CRITICAL'
+              else
+              'Plan SSL certificate renewal soon.'
+              if ssl_status == 'WARNING'
+              else
+              '✓ No action required.'
+            }}
+
+          - ""
+
+          - "============================================================"
+          - "FINAL SSL STATUS : {{ ssl_status }}"
+          - "============================================================"
